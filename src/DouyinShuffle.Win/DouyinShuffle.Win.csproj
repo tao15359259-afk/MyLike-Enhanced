@@ -13,10 +13,10 @@
     <NuGetAudit>false</NuGetAudit>
 
     <!-- 发布即用(GitHub Release):用户下载解压双击即跑,无需装 .NET/SDK -->
-    <Version>1.0.0</Version>
-    <Product>MyLike</Product>
-    <Description>抖音喜欢列表本地收藏与洗牌播放器</Description>
-    <Authors>MyLike</Authors>
+    <Version>1.1.0</Version>
+    <Product>MyLike-Enhanced</Product>
+    <Authors>tao15359259-afk</Authors>
+    <Description>抖音喜欢/收藏列表本地收藏与洗牌播放器(增强版:收藏采集+深度探测分段跳坑)</Description>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- CET(硬件强制的堆栈保护 / Intel CET Shadow Stack)策略说明:

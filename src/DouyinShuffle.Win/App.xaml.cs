@@ -18,7 +18,7 @@ public partial class App : Application
             ex.Handled = true;
             AppLog.Write("UI UNHANDLED " + ex.Exception);
             MessageBox.Show($"发生未处理的错误:{ex.Exception.Message}\n\n详细信息已写入日志:\n{LogPathHint}",
-                "MyLike", MessageBoxButton.OK, MessageBoxImage.Warning);
+                "MyLike-Enhanced", MessageBoxButton.OK, MessageBoxImage.Warning);
         };
         AppDomain.CurrentDomain.UnhandledException += (_, ex) =>
         {
