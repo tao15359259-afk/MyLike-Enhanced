@@ -442,10 +442,13 @@ public partial class MainWindow : Window
             _orchestrator?.Stop();
             for (var i = 0; i < 20 && _orchestrator is { IsCollecting: true }; i++) await Task.Delay(250);
             _store = new LikeListStore(_dataDir);
-            var (saved, state) = await Task.Run(() => (_store.LoadItems(), _store.LoadState()));
+            var (saved, state, collSaved) = await Task.Run(() =>
+                (_store.LoadItems(), _store.LoadState(), _store.LoadItems(CollectSource.Collection)));
             _collector?.Clear();
-            _collector?.Seed(saved, state.MaxCursor);
+            _collector?.Seed(saved, state.MaxCursor);                                    // 喜欢域
+            _collector?.Seed(collSaved, state.CollectionMaxCursor, CollectSource.Collection);   // 收藏域(v1.0.8)
             _orchestrator?.SeedState(state.SecUserId, state.CollectIncomplete);
+            _orchestrator?.SeedCollectionIncomplete(state.CollectionCollectIncomplete);
             DispatchUi("window.__dsh_refresh && window.__dsh_refresh()");
             await PushStateAsync();
         }
@@ -658,11 +661,14 @@ public partial class MainWindow : Window
         _store = new LikeListStore(_dataDir);
         if (_store.HasLegacyData()) { _store.MigrateLegacy(); }
         // 大数据量(几十万条 = 几十 MB JSON)启动读盘耗时秒级,放后台线程避免卡启动画面
-        var (saved, state) = await Task.Run(() => (_store.LoadItems(), _store.LoadState()));
+        // v1.0.8:同时读两域(items.dylist 喜欢 + collection.dylist 收藏)
+        var (saved, state, collSaved) = await Task.Run(() =>
+            (_store.LoadItems(), _store.LoadState(), _store.LoadItems(CollectSource.Collection)));
 
         _collector = new LikeCollector(DouyinCore!);
         _unlikeService = new UnlikeService(DouyinCore!);   // 进度/结果由 UnlikeRunAsync 统一转发
-        _collector.Seed(saved, state.MaxCursor);
+        _collector.Seed(saved, state.MaxCursor);                                    // 喜欢域
+        _collector.Seed(collSaved, state.CollectionMaxCursor, CollectSource.Collection);   // 收藏域(v1.0.8)
         var collecting = false;
         _collector.StatusChanged += msg =>
         {
@@ -670,11 +676,12 @@ public partial class MainWindow : Window
             if (collecting) DispatchUi($"window.__dsh_collectStatus && window.__dsh_collectStatus({JsonText(msg)})");
         };
         _collector.Diagnostic += msg => AppLog.Write("DIAG " + msg);
-        _collector.CountChanged += count => DispatchUi($"window.__dsh_count && window.__dsh_count({count})");
+        _collector.CountChanged += (src, count) => DispatchUi($"window.__dsh_count && window.__dsh_count({JsonText(src.Name())},{count})");
 
         // 采集编排器(风控事件接线)
         _orchestrator = new CollectOrchestrator(this);
         _orchestrator.SeedState(state.SecUserId, state.CollectIncomplete);
+        _orchestrator.SeedCollectionIncomplete(state.CollectionCollectIncomplete);   // v1.0.8:收藏域断点标志
         collecting = true;   // StatusChanged 闭包用(与编排器生命周期一致,简化传参)
         _collector.RiskDetected += _orchestrator.OnCollectRisk;
         await _collector.InstallAsync();
@@ -1404,7 +1411,8 @@ public partial class MainWindow : Window
                 catch { }
             }
             _orchestrator?.ClearSecUid();
-            SaveNow();
+            SaveNow();                        // 喜欢域收尾落盘
+            SaveNow(null, CollectSource.Collection);   // v1.0.8:收藏域一并落盘
             try { core.Navigate(DouyinProbe.DouyinHomeUrl); } catch { }
             await PushStateAsync();
             return "ok";
@@ -1428,16 +1436,18 @@ public partial class MainWindow : Window
         try { UiWebView.CoreWebView2?.ExecuteScriptAsync(js); } catch { }
     }
 
-    /// <summary>推送登录态+数量到 UI(右上角按钮切换:登录 ↔ 退出登录)。</summary>
+    /// <summary>推送登录态+数量到 UI(右上角按钮切换:登录 ↔ 退出登录)。
+    /// v1.0.8:count(=喜欢数,兼容保留)+ countLike/countColl 双源计数。</summary>
     internal async Task PushStateAsync()
     {
         try
         {
             var loggedIn = await IsLoggedInAsync();
-            var count = _collector?.Count ?? 0;
+            var likeCount = _collector?.CountOf(CollectSource.Like) ?? 0;
+            var collCount = _collector?.CountOf(CollectSource.Collection) ?? 0;
             // theme 随每次状态广播下发:换账号 = 换 WebView/profile,页面重载后靠这条恢复外观
-            DispatchUi($"window.__dsh_state && window.__dsh_state({{loggedIn:{(loggedIn ? "true" : "false")},count:{count},theme:{JsonText(_settings.Theme)}}})");
-            AppLog.Write($"STATE loggedIn={loggedIn} count={count}");
+            DispatchUi($"window.__dsh_state && window.__dsh_state({{loggedIn:{(loggedIn ? "true" : "false")},count:{likeCount},countLike:{likeCount},countColl:{collCount},theme:{JsonText(_settings.Theme)}}})");
+            AppLog.Write($"STATE loggedIn={loggedIn} like={likeCount} coll={collCount}");
         }
         catch (Exception ex) { AppLog.Write("STATE ERR " + ex.Message); }
     }
@@ -1452,17 +1462,20 @@ public partial class MainWindow : Window
     private bool _saveQueued;
     private bool _saveRunning;
     private bool? _saveQueuedIncomplete;
+    /// <summary>待落盘的源集合(v1.0.8:喜欢/收藏两域各自落盘,排队期间合并去重)。</summary>
+    private readonly HashSet<CollectSource> _saveQueuedSrcs = new();
     private TaskCompletionSource<bool>? _saveIdle;
 
-    internal void SaveNow(bool? collectIncomplete = null) => RequestSave(collectIncomplete);
+    internal void SaveNow(bool? collectIncomplete = null, CollectSource src = CollectSource.Like) => RequestSave(collectIncomplete, src);
 
-    private void RequestSave(bool? collectIncomplete)
+    private void RequestSave(bool? collectIncomplete, CollectSource src)
     {
         if (_collector == null || _store == null) return;
         lock (_saveGate)
         {
             _saveQueued = true;
             if (collectIncomplete.HasValue) _saveQueuedIncomplete = collectIncomplete;
+            _saveQueuedSrcs.Add(src);
             if (_saveRunning) return;
             _saveRunning = true;
             _saveIdle = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1475,6 +1488,7 @@ public partial class MainWindow : Window
         while (true)
         {
             bool? incomplete;
+            List<CollectSource> srcs;
             lock (_saveGate)
             {
                 if (!_saveQueued)
@@ -1486,23 +1500,31 @@ public partial class MainWindow : Window
                 _saveQueued = false;
                 incomplete = _saveQueuedIncomplete;
                 _saveQueuedIncomplete = null;
+                srcs = _saveQueuedSrcs.ToList();
+                _saveQueuedSrcs.Clear();
             }
-            try { SaveToDisk(incomplete); }
+            try
+            {
+                foreach (var s in srcs)
+                    SaveToDisk(incomplete, s);
+            }
             catch (Exception ex) { AppLog.Write("SAVE ERR " + ex.Message); }
         }
     }
 
-    private void SaveToDisk(bool? collectIncomplete)
+    private void SaveToDisk(bool? collectIncomplete, CollectSource src)
     {
         if (_collector == null || _store == null) return;
-        var (items, cursor) = _collector.Snapshot();
-        _store.Save(items, cursor, _orchestratorSecUid(), collectIncomplete);
+        var (items, cursor) = _collector.Snapshot(src);
+        _store.Save(items, cursor, _orchestratorSecUid(), collectIncomplete, src);
     }
 
-    /// <summary>同步收尾:请求一次最终保存并等后台排空(窗口关闭/进程退出前调用)。</summary>
+    /// <summary>同步收尾:请求一次最终保存并等后台排空(窗口关闭/进程退出前调用)。
+    /// v1.0.8:两域一起请求(各自有未落盘变更时都不会丢)。</summary>
     private void FlushSaveSync()
     {
-        RequestSave(null);
+        RequestSave(null, CollectSource.Like);
+        RequestSave(null, CollectSource.Collection);
         Task? idle;
         lock (_saveGate) idle = _saveRunning ? _saveIdle?.Task : null;
         if (idle != null) { try { idle.Wait(TimeSpan.FromSeconds(2)); } catch { } }
@@ -1511,6 +1533,17 @@ public partial class MainWindow : Window
     private string _orchestratorSecUid() => _orchestrator?.SecUid ?? "";
 
     // ---------- 桥接命令(全部在 UI 线程异步执行) ----------
+
+    /// <summary>解析带尾缀源的命令参数(v1.0.8):args 末位为 "like"/"collection" 时作为采集源
+    /// 并从参数中移除;否则按默认源(Like)处理 —— 旧参数形态/旧调用完全兼容,零回归。</summary>
+    private static (string[] rest, CollectSource src) SplitSourceArgs(string jsonArgs)
+    {
+        var arr = Newtonsoft.Json.JsonConvert.DeserializeObject<string[]>(jsonArgs) ?? Array.Empty<string>();
+        if (arr.Length > 0 && (arr[^1] == CollectSourceExt.LikeName || arr[^1] == CollectSourceExt.CollectionName))
+            return (arr[..^1], CollectSourceExt.Parse(arr[^1]));
+        return (arr, CollectSource.Like);
+    }
+
     private async Task<object?> HandleCmd(string cmd, string jsonArgs)
     {
         try
@@ -1523,7 +1556,8 @@ public partial class MainWindow : Window
                 case "list":
                     {
                         if (_collector == null) return "[]";
-                        var items = _collector.Items
+                        var (_, src) = SplitSourceArgs(jsonArgs);
+                        var items = _collector.ItemsOf(src)
                             .OrderByDescending(i => i.CreateTime)
                             .Select(i => new
                             {
@@ -1553,13 +1587,21 @@ public partial class MainWindow : Window
                         }
                         catch { }
                         var dataMbText = dataMb.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture);
-                        return $"{{\"loggedIn\":{(loggedIn ? "true" : "false")},\"count\":{_collector?.Count ?? 0},\"autoNext\":{(autoNext ? "true" : "false")},\"dataMb\":{dataMbText},\"theme\":{JsonText(_settings.Theme)}}}";
+                        // v1.0.8:count(=喜欢数,兼容保留)+ countLike/countColl 双源计数
+                        var likeCount = _collector?.CountOf(CollectSource.Like) ?? 0;
+                        var collCount = _collector?.CountOf(CollectSource.Collection) ?? 0;
+                        return $"{{\"loggedIn\":{(loggedIn ? "true" : "false")},\"count\":{likeCount},\"countLike\":{likeCount},\"countColl\":{collCount},\"autoNext\":{(autoNext ? "true" : "false")},\"dataMb\":{dataMbText},\"theme\":{JsonText(_settings.Theme)}}}";
                     }
 
                 case "collect":
-                    // 互斥:取消点赞运行中不接受新采集(共用引擎页)
-                    if (_unlikeCts != null) return "err:批量取消点赞运行中,请先完成或停止";
-                    return _orchestrator?.Start() ?? "err:not ready";
+                    {
+                        // 互斥:取消点赞运行中不接受新采集(共用引擎页)
+                        if (_unlikeCts != null) return "err:批量取消点赞运行中,请先完成或停止";
+                        // v1.0.8:args[0] = "like"(缺省)| "collection" —— 采集源随主界面当前视图
+                        var arr = Newtonsoft.Json.JsonConvert.DeserializeObject<string[]>(jsonArgs) ?? Array.Empty<string>();
+                        var src = CollectSourceExt.Parse(arr.Length > 0 ? arr[0] : null);
+                        return _orchestrator?.Start(src.Name()) ?? "err:not ready";
+                    }
 
                 case "stopCollect":
                     _orchestrator?.Stop();
@@ -1570,13 +1612,15 @@ public partial class MainWindow : Window
                         // 互斥:取消点赞运行中不接受新播放(共用引擎页)
                         if (_unlikeCts != null) return "err:批量取消点赞运行中,请先完成或停止";
                         if (_collector == null) return "empty";
-                        var source = _collector.Items;   // 单次快照(每次访问都全量复制,避免重复取)
+                        // v1.0.8:args = [ids..., source?] —— 按主界面当前视图的源取队列
+                        var (rest, src) = SplitSourceArgs(jsonArgs);
+                        var source = _collector.ItemsOf(src);   // 单次快照(每次访问都全量复制,避免重复取)
                         if (source.Count == 0) return "empty";
                         if (!await IsLoggedInAsync()) return "err:未登录,请先点登录";
                         // ★先拉起播放页(加载态),再筛队列、再取直链
                         await PreparePlayerAsync("正在获取播放地址…");
                         // 支持按当前筛选条件洗牌:UI 传入选中的 awemeId 列表(可选)
-                        var ids = Newtonsoft.Json.JsonConvert.DeserializeObject<string[]>(jsonArgs) ?? Array.Empty<string>();
+                        var ids = rest;
                         if (ids.Length > 0)
                         {
                             var idSet = new HashSet<string>(ids);
@@ -1597,20 +1641,21 @@ public partial class MainWindow : Window
                     {
                         // 互斥:取消点赞运行中不接受新播放(共用引擎页)
                         if (_unlikeCts != null) return "err:批量取消点赞运行中,请先完成或停止";
-                        var args = Newtonsoft.Json.JsonConvert.DeserializeObject<string[]>(jsonArgs) ?? Array.Empty<string>();
-                        var awemeId = args.Length > 0 ? args[0] : "";
+                        // v1.0.8:args = [awemeId, queueIds..., source?] —— 按主界面当前视图的源取队列
+                        var (rest, src) = SplitSourceArgs(jsonArgs);
+                        var awemeId = rest.Length > 0 ? rest[0] : "";
                         if (awemeId.Length == 0 || _collector == null || _player == null) return "err";
                         if (!await IsLoggedInAsync()) return "err:未登录,请先点登录";
                         // ★先拉起播放页(加载态):队列筛选/条目定位/取直链都在其后
                         await PreparePlayerAsync("正在获取播放地址…");
-                        // 单次快照:Items 每次访问都全量复制(数万条时数 ms),一条命令只取一次
-                        var all = _collector.Items;
+                        // 单次快照:ItemsOf 每次访问都全量复制(数万条时数 ms),一条命令只取一次
+                        var all = _collector.ItemsOf(src);
                         // 队列 = UI 传入的当前筛选列表(图集/视频/年月/搜索,与 shuffle 同一来源);
                         // 未传(旧调用/兜底)则回退全量队列(排除失效,时间倒序)
                         List<AwemeItem> queue;
-                        if (args.Length > 1)
+                        if (rest.Length > 1)
                         {
-                            var idSet = new HashSet<string>(args[1..]);
+                            var idSet = new HashSet<string>(rest[1..]);
                             queue = all
                                 .Where(i => i.Status != 1 && idSet.Contains(i.AwemeId))
                                 .OrderByDescending(i => i.CreateTime)
@@ -1653,8 +1698,10 @@ public partial class MainWindow : Window
                             return "err:正在采集中,请先停止采集再取消点赞";
                         if (_player is { IsActive: true })
                             return "err:正在播放中,请先停止播放再取消点赞";
-                        var ids = Newtonsoft.Json.JsonConvert.DeserializeObject<string[]>(jsonArgs)
-                                  ?? Array.Empty<string>();
+                        var (rest, src) = SplitSourceArgs(jsonArgs);
+                        if (src != CollectSource.Like)
+                            return "err:收藏内容与点赞无关,请在「喜欢」视图操作取消点赞";   // v1.0.8 保险
+                        var ids = rest;
                         if (_collector == null || _store == null || _unlikeService == null)
                             return "err:not ready";
                         if (ids.Length == 0)
@@ -1674,31 +1721,37 @@ public partial class MainWindow : Window
 
                 case "delete":
                     {
-                        var ids = Newtonsoft.Json.JsonConvert.DeserializeObject<string[]>(jsonArgs) ?? Array.Empty<string>();
+                        // v1.0.8:args = [ids..., source?] —— 按主界面当前视图的源删除本地记录
+                        var (ids, src) = SplitSourceArgs(jsonArgs);
                         if (_collector == null || _store == null) return "err";
-                        foreach (var id in ids) _collector.Remove(id);
-                        SaveNow();
+                        foreach (var id in ids) _collector.Remove(id, src);
+                        SaveNow(null, src);
                         await PushStateAsync();
                         return "ok";
                     }
 
                 case "export":
                     {
-                        if (_collector == null || _collector.Items.Count == 0) return "还没有数据";
-                        SaveNow();
+                        // v1.0.8:args = [source?] —— 导出主界面当前视图的源
+                        var (_, src) = SplitSourceArgs(jsonArgs);
+                        if (_collector == null || _collector.CountOf(src) == 0) return "还没有数据";
+                        SaveNow(null, src);
                         var dlg = new Microsoft.Win32.SaveFileDialog
                         {
                             Title = "导出播放列表",
                             Filter = "抖音收藏列表 (*.dylist)|*.dylist",
-                            FileName = $"douyin_likes_{DateTime.Now:yyyyMMdd_HHmmss}.dylist"
+                            FileName = (src == CollectSource.Collection ? "douyin_collections_" : "douyin_likes_")
+                                       + $"{DateTime.Now:yyyyMMdd_HHmmss}.dylist"
                         };
                         if (dlg.ShowDialog() != true) return "已取消";
-                        Exporter.ExportDylist(_collector.Items, dlg.FileName);
-                        return $"已导出 {_collector.Count} 条";
+                        Exporter.ExportDylist(_collector.ItemsOf(src), dlg.FileName);
+                        return $"已导出 {_collector.CountOf(src)} 条";
                     }
 
                 case "import":
                     {
+                        // v1.0.8:args = [source?] —— 合并导入到主界面当前视图的源(.dylist 格式两域通用)
+                        var (_, src) = SplitSourceArgs(jsonArgs);
                         if (_collector == null || _store == null) return "err";
                         var dlg = new Microsoft.Win32.OpenFileDialog
                         {
@@ -1708,12 +1761,12 @@ public partial class MainWindow : Window
                         if (dlg.ShowDialog() != true) return "已取消";
                         var imported = Exporter.ImportDylist(dlg.FileName);
                         if (imported == null) return "导入失败:格式不符";
-                        var before = _collector.Count;
-                        _collector.Seed(imported);
-                        SaveNow();
+                        var before = _collector.CountOf(src);
+                        _collector.Seed(imported, 0, src);
+                        SaveNow(null, src);
                         await PushStateAsync();
                         DispatchUi("window.__dsh_refresh && window.__dsh_refresh()");
-                        return $"导入完成,新增 {_collector.Count - before} 条";
+                        return $"导入完成,新增 {_collector.CountOf(src) - before} 条";
                     }
 
                 case "login":
@@ -1831,12 +1884,16 @@ public partial class MainWindow : Window
 
                 case "resumeInfo":
                     // "继续上次播放"提示条数据:上次手动退出时的条目/位置/队列长度(与当前账号数据域一致)
+                    // v1.0.8:存活判定跨两域(快照可能来自收藏域的播放会话),喜欢路径行为不变
                     {
-                        if (_collector == null || _collector.Items.Count == 0) return "null";
+                        if (_collector == null) return "null";
+                        var alive = new HashSet<string>(_collector.ItemsOf(CollectSource.Like).Select(i => i.AwemeId));
+                        foreach (var it in _collector.ItemsOf(CollectSource.Collection)) alive.Add(it.AwemeId);
+                        if (alive.Count == 0) return "null";
                         var snap = new ResumeStore(_dataDir).Load();
                         if (snap == null || !snap.ManualExit || snap.QueueIds.Count == 0) return "null";
-                        var alive = new HashSet<string>(_collector.Items.Select(i => i.AwemeId));
-                        var item = _collector.Items.FirstOrDefault(i => i.AwemeId == snap.AwemeId);
+                        var item = _collector.ItemsOf(CollectSource.Like).FirstOrDefault(i => i.AwemeId == snap.AwemeId)
+                                   ?? _collector.ItemsOf(CollectSource.Collection).FirstOrDefault(i => i.AwemeId == snap.AwemeId);
                         if (item == null || !alive.Contains(snap.AwemeId)) return "null";
                         var usable = snap.QueueIds.Count(alive.Contains);
                         return Newtonsoft.Json.JsonConvert.SerializeObject(new
@@ -1850,6 +1907,7 @@ public partial class MainWindow : Window
 
                 case "resumePlayback":
                     // 继续上次播放:先拉起播放页 → 按快照重建队列 → 跳到记忆条目 → seek 记忆位置
+                    // v1.0.8:条目查找跨两域(与 resumeInfo 同口径)
                     {
                         if (_unlikeCts != null) return "err:批量取消点赞运行中,请先完成或停止";
                         if (_collector == null || _player == null) return "err";
@@ -1859,7 +1917,9 @@ public partial class MainWindow : Window
                         await PreparePlayerAsync("正在恢复上次播放…");
                         var snap = new ResumeStore(_dataDir).Load();
                         if (snap == null) return PlayerBackToUi("err:没有播放快照");
-                        var all = _collector.Items;
+                        var all = _collector.ItemsOf(CollectSource.Like)
+                            .Concat(_collector.ItemsOf(CollectSource.Collection))
+                            .ToList();
                         var alive = all.Where(i => snap.QueueIds.Contains(i.AwemeId) && i.Status != 1)
                                        .OrderBy(i => snap.QueueIds.IndexOf(i.AwemeId))
                                        .ToList();

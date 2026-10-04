@@ -90,6 +90,8 @@ input, select, textarea { color:var(--text); }
 #btn-refresh-list:hover { background:var(--accent-dark); color:#fff; }
 .side-icon { width:18px; text-align:center; }
 .side-count { margin-left:auto; font-size:12px; color:var(--text-mute); }
+/* 数据源切换(喜欢/收藏)与分类导航之间的分隔线(v1.0.8) */
+.side-sep { height:1px; background:var(--border); margin:10px 4px; }
 .side-foot { margin-top:auto; padding:10px 12px; font-size:12px; color:var(--text-dim); }
 
 /* 侧栏底部帮助按钮(常见问题,红底) + 登录状态:整组贴底 */

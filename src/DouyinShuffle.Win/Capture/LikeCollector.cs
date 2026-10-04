@@ -8,9 +8,11 @@ namespace DouyinShuffle.Win.Capture;
 /// 引擎页保持"零初始化脚本"的干净状态,采集脚本经 ExecuteScriptAsync 瞬时注入(用后即弃),
 /// 在页面上下文发裸 fetch 由 webmssdk 拦截器自动补签名,响应经消息通道回传统一入库。
 ///
-/// 采集为单一通道(paged-loop.js,历史教训:曾有"主动签名"二级回退通道,
+/// 采集为单一通道(paged-loop.js / collection-loop.js,历史教训:曾有"主动签名"二级回退通道,
 /// 依赖的全局签名函数在新版抖音已收进 webmssdk 内部,实测 10 次调用零成功,已删)。
-/// 失败分流由宿主编排:网络抖动 → 退避重试;限流 → favorite 探测确认后弹滑块。
+/// 失败分流由宿主编排:网络抖动 → 退避重试;限流 → 探测确认后弹滑块。
+/// v1.0.8:新增收藏域(listcollection)与喜欢域(favorite)平行 —— 各自独立集合/断点游标/
+/// 注入脚本/存储文件;Like 为默认源,既有调用点行为不变(零回归)。
 ///
 /// 消息协议(JS → C#,全部经 chrome.webview.postMessage):
 /// - direct_started  {cursor}          脚本已执行(同步心跳;看门狗喂狗)
@@ -30,12 +32,19 @@ public sealed class LikeCollector
 {
     private readonly CoreWebView2 _webView;
     private readonly Dictionary<string, AwemeItem> _items = new();
+    /// <summary>收藏域条目(v1.0.8):与喜欢域平行存储,awemeId 各自独立主键(同视频可同时出现在两域)。</summary>
+    private readonly Dictionary<string, AwemeItem> _collItems = new();
     private readonly object _sync = new();
     private long _maxCursor;
+    /// <summary>收藏域断点游标(与喜欢域 _maxCursor 平行,互不覆盖)。</summary>
+    private long _collMaxCursor;
     private string _currentUrl = "";
 
     /// <summary>直连翻页模式:响应不过位置闸门(可能不在喜欢页)。</summary>
     private volatile bool _directMode;
+
+    /// <summary>当前直连轮次采集的源(JS 消息回传入库时按此分流到对应域的集合/游标)。</summary>
+    private volatile CollectSource _directSource = CollectSource.Like;
 
     /// <summary>直连结束通知(JS 循环回传 direct_done 时置位)。</summary>
     private TaskCompletionSource<string>? _directTcs;
@@ -46,8 +55,9 @@ public sealed class LikeCollector
     /// <summary>直连采集是否正在进行(并发保护:同时只允许一个 JS 翻页循环)。</summary>
     private volatile bool _directRunning;
 
-    /// <summary>直连采集中已入库条数(进度推送用;JS 只回传页级进度)。</summary>
+    /// <summary>直连采集中已入库条数(进度推送用;JS 只回传页级进度)。按源各自记录。</summary>
     private int _directStoredAtStart;
+    private int _collStoredAtStart;
 
     /// <summary>接口失败退避重试中(direct_fail 置位,direct_progress 清除)→ 进度文案附带"接口受限正在重试"提示。</summary>
     private bool _retrying;
@@ -64,8 +74,8 @@ public sealed class LikeCollector
     /// <summary>状态变化(UI 线程)。</summary>
     public event Action<string>? StatusChanged;
 
-    /// <summary>已采数量变化(UI 线程,实时)。</summary>
-    public event Action<int>? CountChanged;
+    /// <summary>已采数量变化(UI 线程,实时)。附源:两域共用引擎页,UI 按源更新对应计数。</summary>
+    public event Action<CollectSource, int>? CountChanged;
 
     /// <summary>疑似被风控(直连连续空响应)。宿主应复核后弹验证窗口。</summary>
     public event Action? RiskDetected;
@@ -85,30 +95,48 @@ public sealed class LikeCollector
     /// </summary>
     public Task InstallAsync() => Task.CompletedTask;
 
-    public IReadOnlyCollection<AwemeItem> Items
+    public IReadOnlyCollection<AwemeItem> Items => ItemsOf(CollectSource.Like);
+
+    /// <summary>按源取全部条目(快照复制;默认喜欢域,既有调用点行为不变)。</summary>
+    public IReadOnlyCollection<AwemeItem> ItemsOf(CollectSource src)
     {
-        get { lock (_sync) return _items.Values.ToList(); }
+        lock (_sync) return (src == CollectSource.Collection ? _collItems : _items).Values.ToList();
     }
 
-    /// <summary>O(1) 计数(避免每加一条就复制整个列表)。</summary>
-    public int Count
+    /// <summary>O(1) 计数(避免每加一条就复制整个列表)。默认=喜欢域计数(既有调用点行为不变)。</summary>
+    public int Count => CountOf(CollectSource.Like);
+
+    public int CountOf(CollectSource src)
     {
-        get { lock (_sync) return _items.Count; }
+        lock (_sync) return (src == CollectSource.Collection ? _collItems : _items).Count;
     }
 
-    public long MaxCursor { get { lock (_sync) return _maxCursor; } }
+    public long MaxCursor => MaxCursorOf(CollectSource.Like);
+
+    /// <summary>按源取断点游标。</summary>
+    public long MaxCursorOf(CollectSource src)
+    {
+        lock (_sync) return src == CollectSource.Collection ? _collMaxCursor : _maxCursor;
+    }
     public bool IsRunning => _directRunning;
 
     /// <summary>最近一次响应的边界游标(每页解析即更新,不受 trackCursor 影响)。
     /// 两阶段采集(issue #3):头部增量阶段按编排器传入的 trackCursor 决定是否回写断点,
-    /// 续轮起点由编排器读本属性驱动 —— 已有深断点时断点(_maxCursor)保持原值不互踩。</summary>
+    /// 续轮起点由编排器读本属性驱动 —— 已有深断点时断点(_maxCursor)保持原值不互踩。
+    /// v1.0.8:喜欢/收藏两域各自一套(按 _directSource 分流),互不覆盖。</summary>
     private long _lastBoundary;
+    private long _collLastBoundary;
 
     /// <summary>当前轮次是否把翻页进度回写断点游标(经 StartDirectAsync 传入;默认 true=旧行为)。</summary>
     private volatile bool _trackCursor = true;
 
-    /// <summary>最近一次解析到的边界游标(0=本轮还没有合法页)。</summary>
-    public long LastBoundaryCursor { get { lock (_sync) return _lastBoundary; } }
+    /// <summary>最近一次解析到的边界游标(0=本轮还没有合法页)。默认=喜欢域(既有调用点行为不变)。</summary>
+    public long LastBoundaryCursor => LastBoundaryCursorOf(CollectSource.Like);
+
+    public long LastBoundaryCursorOf(CollectSource src)
+    {
+        lock (_sync) return src == CollectSource.Collection ? _collLastBoundary : _lastBoundary;
+    }
 
     // ---------- 消息回传 ----------
 
@@ -126,7 +154,7 @@ public sealed class LikeCollector
                 var reason = jo["reason"]?.Value<string>() ?? "unknown";
                 var fetched = jo["fetched"]?.Value<int>() ?? 0;
                 var totalItems = jo["totalItems"]?.Value<int>() ?? 0;
-                Diagnostic?.Invoke($"DIRECT-DONE reason={reason} pages={fetched} rawItems={totalItems} stored={Count}");
+                Diagnostic?.Invoke($"DIRECT-DONE reason={reason} pages={fetched} rawItems={totalItems} stored={CountOf(_directSource)}");
                 // 首页即失败(fetched=0)= 接口黑洞 → 宿主切换二级签名采集,不当风控处理;
                 // 采集中途失败(fetched>0)才走风控复核流程
                 if (reason is "blocked" or "error" && fetched > 0)
@@ -159,11 +187,15 @@ public sealed class LikeCollector
             if (type == "direct_progress")
             {
                 var fetched = jo["fetched"]?.Value<int>() ?? 0;
-                var newCount = Count - _directStoredAtStart;
+                var src = _directSource;
+                var storedAtStart = src == CollectSource.Collection ? _collStoredAtStart : _directStoredAtStart;
+                var count = CountOf(src);
+                var newCount = count - storedAtStart;
                 var retryTip = _retrying ? " · 接口受限正在重试,被动失败后请等一会儿再采集" : "";
-                StatusChanged?.Invoke($"采集中(第 {Round} 轮):本轮新增 {newCount} 条 · 已采 {Count} 条(本轮第 {fetched} 页)…{retryTip}");
+                var srcLabel = src == CollectSource.Collection ? "收藏" : "喜欢";
+                StatusChanged?.Invoke($"采集中(第 {Round} 轮·{srcLabel}):本轮新增 {newCount} 条 · 已采 {count} 条(本轮第 {fetched} 页)…{retryTip}");
                 _retrying = false;   // 有成功页返回 → 恢复为正常采集状态
-                CountChanged?.Invoke(Count);
+                CountChanged?.Invoke(src, count);
                 return;
             }
 
@@ -221,24 +253,28 @@ public sealed class LikeCollector
 
     private void ProcessBody(string body)
     {
-        var parsed = AwemeParser.Parse(body);
+        // 收藏域宽松读游标(cursor 字段);喜欢域严格走旧解析(max_cursor ?? 0,零回归)
+        var parsed = AwemeParser.Parse(body, looseCursor: _directSource == CollectSource.Collection);
 
         // 位置闸门:被动捕获(页面自身请求)只收"用户主页喜欢 Tab"的数据;
         // 直连翻页模式响应来自页面签名的定向 fetch,不受页面位置限制。
         if (!_directMode && !(_currentUrl.Contains("/user/") && _currentUrl.Contains("showTab=like"))) return;
 
+        // 按当前轮次源分流:喜欢/收藏各自集合与游标,互不污染(既有喜欢路径行为不变)
+        var src = _directSource;
         lock (_sync)
         {
+            var dict = src == CollectSource.Collection ? _collItems : _items;
             foreach (var item in parsed.Items)
             {
-                if (_items.TryAdd(item.AwemeId, item))
+                if (dict.TryAdd(item.AwemeId, item))
                 {
                     ItemAdded?.Invoke(item);
                 }
                 else
                 {
                     // 已存在 → 更新直链(链接保鲜:重采时刷新旧条目链接,播放不因链接过期而卡)
-                    if (_items.TryGetValue(item.AwemeId, out var existing))
+                    if (dict.TryGetValue(item.AwemeId, out var existing))
                     {
                         var changed = false;
                         if (item.PlayUrls.Count > 0 && !ListsEqual(existing.PlayUrls, item.PlayUrls))
@@ -263,8 +299,16 @@ public sealed class LikeCollector
             }
             if (parsed.MaxCursor > 0)
             {
-                _lastBoundary = parsed.MaxCursor;   // 边界游标:每页即记(两阶段续轮用,不受 trackCursor 影响)
-                if (_trackCursor) _maxCursor = parsed.MaxCursor;   // 断点游标:仅断点续采阶段回写
+                if (src == CollectSource.Collection)
+                {
+                    _collLastBoundary = parsed.MaxCursor;   // 边界游标:每页即记(两阶段续轮用,不受 trackCursor 影响)
+                    if (_trackCursor) _collMaxCursor = parsed.MaxCursor;   // 断点游标:仅断点续采阶段回写
+                }
+                else
+                {
+                    _lastBoundary = parsed.MaxCursor;   // 边界游标:每页即记(两阶段续轮用,不受 trackCursor 影响)
+                    if (_trackCursor) _maxCursor = parsed.MaxCursor;   // 断点游标:仅断点续采阶段回写
+                }
             }
         }
     }
@@ -323,27 +367,44 @@ public sealed class LikeCollector
     public Task<string> StartDirectAsync(string secUserId, long startCursor,
         IReadOnlyCollection<string> knownIds, CancellationToken cancellationToken,
         bool trackCursor = true, bool hardResume = false)
-        => RunPagedLoopAsync(secUserId, startCursor, knownIds, cancellationToken, trackCursor, hardResume);
+        => RunPagedLoopAsync(secUserId, startCursor, knownIds, cancellationToken, trackCursor, hardResume, CollectSource.Like);
+
+    /// <summary>启动收藏列表直连翻页采集(v1.0.8):与喜欢域同构,换收藏脚本与断点域。
+    /// secUserId 仅保留签名一致性占位(收藏接口不需要,内部忽略);消息协议与喜欢域完全一致。</summary>
+    public Task<string> StartCollectionDirectAsync(long startCursor,
+        IReadOnlyCollection<string> knownIds, CancellationToken cancellationToken,
+        bool trackCursor = true, bool hardResume = false)
+        => RunPagedLoopAsync("", startCursor, knownIds, cancellationToken, trackCursor, hardResume, CollectSource.Collection);
 
     /// <summary>
     /// 直连翻页采集。裸 fetch + 结构性参数,webmssdk 拦截器自动补签名,
-    /// 循环改 max_cursor 翻页,响应经消息通道回传复用 ProcessBody 入库。
-    /// 增量模式:knownIds 非空时,整页全为已知 ID 即停(喜欢列表倒序,断点后旧内容无需重翻)。
+    /// 循环改游标翻页,响应经消息通道回传复用 ProcessBody 入库。
+    /// 增量模式:knownIds 非空时,整页全为已知 ID 即停(列表倒序,断点后旧内容无需重翻)。
+    /// src=Like 时行为与升级前逐字节一致(喜欢路径零回归)。
     /// </summary>
     private async Task<string> RunPagedLoopAsync(string secUserId, long startCursor,
         IReadOnlyCollection<string> knownIds, CancellationToken cancellationToken,
-        bool trackCursor = true, bool hardResume = false)
+        bool trackCursor, bool hardResume, CollectSource src)
     {
         if (_directRunning) return "busy"; // 已有翻页循环,拒绝并发
-        if (string.IsNullOrEmpty(secUserId)) return "nouser";
+        if (src == CollectSource.Like && string.IsNullOrEmpty(secUserId)) return "nouser";
+        // 收藏接口不需要 sec_user_id(登录态即可),不校验 secUserId
         _directRunning = true;
-        _directStoredAtStart = Count;
+        _directSource = src;
+        if (src == CollectSource.Collection)
+        {
+            _collStoredAtStart = CountOf(src);
+        }
+        else
+        {
+            _directStoredAtStart = CountOf(src);
+        }
         _trackCursor = trackCursor;   // busy 检查之后才置位:不污染已在跑轮次的游标行为
-        lock (_sync) _lastBoundary = 0;
+        lock (_sync) { if (src == CollectSource.Collection) _collLastBoundary = 0; else _lastBoundary = 0; }
 
         // 已有数据量大时启用增量(至少 50 条才有意义;全量重采只在用户主动清空后)
         List<string> known;
-        lock (_sync) known = _items.Keys.ToList();
+        lock (_sync) known = (src == CollectSource.Collection ? _collItems : _items).Keys.ToList();
         var useIncremental = knownIds.Count > 0 && known.Count >= 50;
         var knownJson = "null";
         if (useIncremental)
@@ -362,7 +423,7 @@ public sealed class LikeCollector
             knownJson = sb.ToString();
         }
 
-        var js = ScriptLoader.Get("paged-loop.js")
+        var js = ScriptLoader.Get(src == CollectSource.Collection ? "collection-loop.js" : "paged-loop.js")
             .Replace("{{SEC_USER_ID}}", secUserId)
             .Replace("{{START_CURSOR}}", startCursor.ToString())
             .Replace("{{KNOWN_IDS}}", knownJson)
@@ -372,6 +433,7 @@ public sealed class LikeCollector
         _directTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         _directHeartbeatTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _directMode = true;
+        _directSource = src;   // 消息泵入库按此分流(重复置位无害;必须在任何 direct_resp 到达前生效)
         try
         {
             // 启动 JS 循环(不等待;同步心跳 direct_started 会立即回传,日志可验证脚本已执行)
@@ -402,6 +464,7 @@ public sealed class LikeCollector
         finally
         {
             _directMode = false;
+            _directSource = CollectSource.Like;   // 复位默认源:防被动捕获(非直连)的响应误入收藏域
             _directTcs = null;
             _directHeartbeatTcs = null;
             _directRunning = false;
@@ -418,36 +481,53 @@ public sealed class LikeCollector
         return b.All(set.Contains);
     }
 
-    /// <summary>启动时回填持久化数据(含上次翻页断点 cursor,断点续采用)。</summary>
-    public void Seed(IEnumerable<AwemeItem> saved, long maxCursor = 0)
+    /// <summary>启动时回填持久化数据(含上次翻页断点 cursor,断点续采用)。默认喜欢域(既有调用点行为不变)。</summary>
+    public void Seed(IEnumerable<AwemeItem> saved, long maxCursor = 0, CollectSource src = CollectSource.Like)
     {
         lock (_sync)
         {
-            foreach (var item in saved)
-                _items.TryAdd(item.AwemeId, item);
-            if (maxCursor > 0) _maxCursor = maxCursor;
+            if (src == CollectSource.Collection)
+            {
+                foreach (var item in saved)
+                    _collItems.TryAdd(item.AwemeId, item);
+                if (maxCursor > 0) _collMaxCursor = maxCursor;
+            }
+            else
+            {
+                foreach (var item in saved)
+                    _items.TryAdd(item.AwemeId, item);
+                if (maxCursor > 0) _maxCursor = maxCursor;
+            }
         }
     }
 
-    /// <summary>清空内存中的全部数据(配合存储层清空)。</summary>
+    /// <summary>清空内存中的全部数据(配合存储层清空;两域一起清)。</summary>
     public void Clear()
     {
         lock (_sync)
         {
             _items.Clear();
+            _collItems.Clear();
             _maxCursor = 0;
+            _collMaxCursor = 0;
             _lastBoundary = 0;
+            _collLastBoundary = 0;
         }
     }
 
-    /// <summary>按 aweme_id 删除单条(列表删除)。</summary>
-    public void Remove(string awemeId)
+    /// <summary>按 aweme_id 删除单条(列表删除)。默认喜欢域(既有调用点行为不变)。</summary>
+    public void Remove(string awemeId, CollectSource src = CollectSource.Like)
     {
-        lock (_sync) _items.Remove(awemeId);
+        lock (_sync) (src == CollectSource.Collection ? _collItems : _items).Remove(awemeId);
     }
 
-    public (List<AwemeItem> items, long cursor) Snapshot()
+    public (List<AwemeItem> items, long cursor) Snapshot() => Snapshot(CollectSource.Like);
+
+    public (List<AwemeItem> items, long cursor) Snapshot(CollectSource src)
     {
-        lock (_sync) return (_items.Values.ToList(), _maxCursor);
+        lock (_sync)
+            return src == CollectSource.Collection
+                ? (_collItems.Values.ToList(), _collMaxCursor)
+                : (_items.Values.ToList(), _maxCursor);
     }
 }

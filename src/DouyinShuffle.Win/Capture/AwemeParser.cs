@@ -21,7 +21,11 @@ public sealed class ParseResult
 /// </summary>
 public static class AwemeParser
 {
-    public static ParseResult Parse(string jsonBody)
+    /// <summary>
+    /// 解析响应。looseCursor(默认 false,喜欢域行为与升级前逐字节一致):仅收藏域
+    /// (listcollection)传 true —— 其响应游标字段为 cursor(可能为字符串),缺省 max_cursor 时宽松读取。
+    /// </summary>
+    public static ParseResult Parse(string jsonBody, bool looseCursor = false)
     {
         var result = new ParseResult();
         if (string.IsNullOrWhiteSpace(jsonBody)) return result;
@@ -40,11 +44,26 @@ public static class AwemeParser
             }
         }
 
-        result.MaxCursor = root["max_cursor"]?.Value<long>() ?? 0;
+        // 游标:喜欢接口为 max_cursor(数值);收藏接口(listcollection)为 cursor(字符串)。
+        // ★looseCursor=false(喜欢域)严格走旧逻辑(max_cursor ?? 0,零回归);
+        //   true(收藏域)才允许回落读 cursor 字段。
+        result.MaxCursor = root["max_cursor"]?.Value<long>()
+                           ?? (looseCursor ? ReadCursorLoose(root["cursor"]) : 0);
         result.HasMore = root["has_more"]?.Value<bool>() ?? false;
         result.StatusCode = root["status_code"]?.Value<int>() ?? -1;
         result.StatusMsg = root["status_msg"]?.Value<string>() ?? "";
         return result;
+    }
+
+    /// <summary>宽松读游标(long 或数字字符串;缺省/非数值 → 0)。</summary>
+    private static long ReadCursorLoose(JToken? token)
+    {
+        if (token == null) return 0;
+        try { return token.Value<long>(); }
+        catch
+        {
+            return long.TryParse(token.Value<string>()?.Trim(), out var v) ? v : 0;
+        }
     }
 
     /// <summary>从单条 aweme token 提取记录(兼容 aweme_list 元素与 aweme_detail)。

@@ -23,11 +23,27 @@ public sealed class SyncState
 
     /// <summary>UI 偏好:自动连播开关(默认关)。与采集状态同文件存储,采集保存时保留不覆盖。</summary>
     public bool AutoNext { get; set; }
+
+    // ---------- 收藏域(v1.0.8):与喜欢域同文件平行存储,字段互不覆盖 ----------
+
+    /// <summary>收藏域断点游标(listcollection 接口 cursor)。</summary>
+    public long CollectionMaxCursor { get; set; }
+
+    /// <summary>收藏域已采条数。</summary>
+    public int CollectionCollectedCount { get; set; }
+
+    /// <summary>收藏域上次采集是否未跑完全量(断点续采标志,与喜欢域 CollectIncomplete 平行)。</summary>
+    public bool CollectionCollectIncomplete { get; set; }
+
+    /// <summary>收藏域最近同步时间(unix 秒)。</summary>
+    public long CollectionLastSyncAt { get; set; }
 }
 
 /// <summary>
 /// JSON 文件存储(.dylist 播放列表 + state.json)。
 /// format:2 = 只存元数据(链接类字段 [JsonIgnore] 不持久化),播放列表/导入导出/采集三者为同一数据。
+/// v1.0.8:喜欢域 items.dylist + 收藏域 collection.dylist(同目录平行文件,同 format:2 结构);
+/// state.json 单文件承载两域断点(SyncState Collection* 字段),Save 按源只写本域字段、保留另一域。
 /// </summary>
 public sealed class LikeListStore
 {
@@ -51,12 +67,31 @@ public sealed class LikeListStore
     }
 
     private string ItemsPath => Path.Combine(_dir, "items.dylist");
+    private string CollectionPath => Path.Combine(_dir, "collection.dylist");
     private string StatePath => Path.Combine(_dir, "state.json");
     // 旧格式(含链接),迁移/兼容读取用
     private string LegacyItemsPath => Path.Combine(_dir, "items.json");
 
-    public List<AwemeItem> LoadItems()
+    public List<AwemeItem> LoadItems() => LoadItems(CollectSource.Like);
+
+    /// <summary>按源读列表文件。默认=喜欢域(既有调用点行为不变);收藏域读 collection.dylist。</summary>
+    public List<AwemeItem> LoadItems(CollectSource src)
     {
+        if (src == CollectSource.Collection)
+        {
+            // 收藏域:仅新格式(无旧格式迁移问题)
+            var path = CollectionPath;
+            if (!File.Exists(path)) return new List<AwemeItem>();
+            try
+            {
+                var root = JObject.Parse(File.ReadAllText(path));
+                if (root["format"]?.Value<int>() == Format && root["items"] is JArray arr)
+                    return arr.ToObject<List<AwemeItem>>() ?? new List<AwemeItem>();
+            }
+            catch { }
+            return new List<AwemeItem>();
+        }
+        // 喜欢域:原逻辑不变
         // 优先新格式
         if (File.Exists(ItemsPath))
         {
@@ -103,8 +138,13 @@ public sealed class LikeListStore
     }
 
     public void Save(List<AwemeItem> items, long cursor, string? secUserId = null, bool? collectIncomplete = null)
+        => Save(items, cursor, secUserId, collectIncomplete, CollectSource.Like);
+
+    /// <summary>按源落盘。默认=喜欢域(既有调用点行为不变)。
+    /// state.json 单文件承载两域:只写本域字段、保留另一域既有值(_stateGate 锁内,防互踩)。</summary>
+    public void Save(List<AwemeItem> items, long cursor, string? secUserId, bool? collectIncomplete, CollectSource src)
     {
-        // .dylist 格式:版本头 + 元数据数组(链接字段自动忽略)
+        // .dylist 格式:版本头 + 元数据数组(链接字段自动忽略);两域同构,仅文件名不同
         var root = new JObject
         {
             ["app"] = AppTag,
@@ -113,21 +153,43 @@ public sealed class LikeListStore
             ["saved_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             ["items"] = JArray.FromObject(items)
         };
+        var itemsPath = src == CollectSource.Collection ? CollectionPath : ItemsPath;
         // 原子写:tmp + Replace,防写一半崩溃损坏列表(数万条数据是用户核心资产)
-        AtomicFile.WriteAllText(ItemsPath, root.ToString(Formatting.None));
+        AtomicFile.WriteAllText(itemsPath, root.ToString(Formatting.None));
         lock (_stateGate)
         {
             // 并发安全:与 SaveAutoNext(UI 线程)互斥;prev 取自缓存(含用户最新偏好)
             var prev = _stateCache ?? LoadState();
             var state = new SyncState
             {
-                MaxCursor = cursor,
-                CollectedCount = items.Count,
-                LastSyncAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                SecUserId = secUserId?.Length > 0 ? secUserId : prev.SecUserId,
-                CollectIncomplete = collectIncomplete ?? prev.CollectIncomplete,
-                AutoNext = prev.AutoNext   // UI 偏好:采集保存时保留用户上次选择
+                // UI 偏好:采集保存时保留用户上次选择
+                AutoNext = prev.AutoNext,
+                SecUserId = secUserId?.Length > 0 ? secUserId : prev.SecUserId
             };
+            if (src == CollectSource.Collection)
+            {
+                // 收藏域:写 Collection* 字段;喜欢域字段保留 prev(不互踩)
+                state.MaxCursor = prev.MaxCursor;
+                state.CollectedCount = prev.CollectedCount;
+                state.LastSyncAt = prev.LastSyncAt;
+                state.CollectIncomplete = prev.CollectIncomplete;
+                state.CollectionMaxCursor = cursor;
+                state.CollectionCollectedCount = items.Count;
+                state.CollectionLastSyncAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                state.CollectionCollectIncomplete = collectIncomplete ?? prev.CollectionCollectIncomplete;
+            }
+            else
+            {
+                // 喜欢域:写原字段(行为不变);收藏域字段保留 prev
+                state.MaxCursor = cursor;
+                state.CollectedCount = items.Count;
+                state.LastSyncAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                state.CollectIncomplete = collectIncomplete ?? prev.CollectIncomplete;
+                state.CollectionMaxCursor = prev.CollectionMaxCursor;
+                state.CollectionCollectedCount = prev.CollectionCollectedCount;
+                state.CollectionLastSyncAt = prev.CollectionLastSyncAt;
+                state.CollectionCollectIncomplete = prev.CollectionCollectIncomplete;
+            }
             AtomicFile.WriteAllText(StatePath, JsonConvert.SerializeObject(state, Formatting.Indented));
             _stateCache = state;
         }
@@ -157,11 +219,11 @@ public sealed class LikeListStore
         try { if (File.Exists(LegacyItemsPath)) File.Delete(LegacyItemsPath); } catch { }
     }
 
-    /// <summary>清空全部数据(列表、增量状态、导出文件)。</summary>
+    /// <summary>清空全部数据(两域列表、增量状态、导出文件)。</summary>
     public void ClearAll()
     {
         _stateCache = null;   // 状态缓存随磁盘一起失效
-        foreach (var f in new[] { ItemsPath, LegacyItemsPath, StatePath })
+        foreach (var f in new[] { ItemsPath, CollectionPath, LegacyItemsPath, StatePath })
         {
             try { if (File.Exists(f)) File.Delete(f); } catch { }
         }

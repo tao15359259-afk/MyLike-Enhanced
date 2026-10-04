@@ -29,6 +29,18 @@
   </header>
   <div class="body">
     <nav class="sidenav">
+      <!-- 数据源切换(v1.0.8):喜欢(favorite 接口) / 收藏(listcollection 接口),两域独立存储 -->
+      <div class="side-item src active" id="src-like" title="喜欢列表(点赞过的视频)">
+        <span class="side-icon">&#10084;</span>
+        <span class="side-label">喜欢</span>
+        <span class="side-count" id="src-like-count">0</span>
+      </div>
+      <div class="side-item src" id="src-coll" title="收藏列表(收藏的视频)">
+        <span class="side-icon">&#9733;</span>
+        <span class="side-label">收藏</span>
+        <span class="side-count" id="src-coll-count">0</span>
+      </div>
+      <div class="side-sep"></div>
       <div class="side-item active" id="nav-all">
         <span class="side-icon">&#9650;</span>
         <span class="side-label">全部</span>
@@ -77,12 +89,12 @@
         </div>
         <div class="dash-card">
           <div class="dash-left">
-            <div class="dash-label">MY LIKES</div>
+            <div class="dash-label" id="dash-label">MY LIKES</div>
             <div class="dash-title">已采集 <b id="stat-total">0</b> 条</div>
             <div class="dash-sub" id="dash-sub">可洗牌播放或点击卡片播放。</div>
           </div>
           <button class="collect-btn" id="btn-collect" title="直连快采喜欢列表">
-            <span class="heart">&#10084;</span>采集
+            <span class="heart">&#10084;</span><span id="btn-collect-label">采集</span>
           </button>
         </div>
         <div class="dash-stats">
@@ -171,7 +183,7 @@
       <div class="account-actions">
         <button class="ub-btn primary" id="btn-add-account" style="flex:1">＋ 添加账号</button>
       </div>
-      <div class="account-tip">每个账号独立保存喜欢的列表与采集进度;切换约需几秒。</div>
+      <div class="account-tip">每个账号独立保存喜欢/收藏列表与采集进度;切换约需几秒。</div>
     </div>
   </div>
 </div>

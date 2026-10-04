@@ -125,6 +125,47 @@ public static class DouyinProbe
         finally { core.WebMessageReceived -= Handler; }
     }
 
+    /// <summary>
+    /// 收藏接口(收藏列表)探测(v1.0.8):裸 POST 第一页(count=1 最小开销)。
+    /// 与 CheckFavoriteApiAsync 同构 —— "要采什么就探什么":采集编排/验证完成信号按源用
+    /// 对应接口本身探活(风控分接口,收藏被限时 favorite/self 可能仍正常,反之亦然)。
+    /// 返回 true = 接口可翻页;false = 黑洞/验证页/异常。
+    /// </summary>
+    public static async Task<bool> CheckCollectionApiAsync(CoreWebView2? core, string secUserId)
+    {
+        if (core == null) return false;   // 收藏接口不需要 sec_user_id,参数仅为签名一致性保留
+        var id = Guid.NewGuid().ToString("N");
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void Handler(object? s, CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            try
+            {
+                var jo = JObject.Parse(e.WebMessageAsJson);
+                if (jo?["type"]?.Value<string>() == "coll_resp" && jo["id"]?.Value<string>() == id)
+                    tcs.TrySetResult(jo["result"]?.Value<string>() ?? "");
+            }
+            catch { }
+        }
+        core.WebMessageReceived += Handler;
+        try
+        {
+            // 探测脚本见 Capture/Scripts/collection-probe.js
+            var js = ScriptLoader.Get("collection-probe.js").Replace("{{ID}}", id);
+            await core.ExecuteScriptAsync(js);
+            var v = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(8));   // JS 6s 超时 + 余量
+            AppLog.Write("COLL-PROBE " + v);
+            return v == "ok";
+        }
+        catch { AppLog.Write("COLL-PROBE timeout/err"); return false; }
+        finally { core.WebMessageReceived -= Handler; }
+    }
+
+    /// <summary>按采集源选择探针(编排器统一入口;Like=favorite,Collection=listcollection)。</summary>
+    public static Task<bool> CheckSourceApiAsync(CoreWebView2? core, string secUserId, CollectSource src)
+        => src == CollectSource.Collection
+            ? CheckCollectionApiAsync(core, secUserId)
+            : CheckFavoriteApiAsync(core, secUserId);
+
     /// <summary>页面是否正显示风控验证(滑块/安全验证)。URL 文案双查,尽量导航后 1s 再调。</summary>
     public static async Task<bool> HasCaptchaAsync(CoreWebView2? core)
     {

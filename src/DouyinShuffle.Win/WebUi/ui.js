@@ -25,11 +25,12 @@ window.__dsh_respond = function (id, result) {
 };
 
 // ---------- 状态 ----------
-let items = [];            // 全部条目(已排序)
+let items = [];            // 全部条目(已排序;= 当前数据源的全部条目)
 let filtered = [];
 let selected = new Set();
 let yearFilter = '', monthFilter = '', searchText = '';
 let navFilter = 'all';     // all | video | gallery
+let curSource = 'like';    // 数据源:like(喜欢) | collection(收藏)——v1.0.8 两域独立采集/存储
 let loggedIn = false;
 let curTheme = 'light';    // 当前主题(宿主 settings.json 为准,localStorage 仅首帧回显)
 let collecting = false;
@@ -108,7 +109,10 @@ function applyLoginState() {
 window.__dsh_state = function (st) {
   loggedIn = !!st.loggedIn;
   applyLoginState();
-  setText('stat-total', st.count || items.length);
+  // 双源计数(v1.0.8):左侧源 Tab 常显两域条数;仪表盘大数字跟随当前视图
+  setText('src-like-count', (typeof st.countLike === 'number' ? st.countLike : st.count) || 0);
+  setText('src-coll-count', st.countColl || 0);
+  setText('stat-total', (curSource === 'collection' ? st.countColl : st.count) || items.length);
   // 数据占用(MB):"失效"卡已替换为"占用 (MB)"卡(v1.0.7,失效数卡片信息量低)
   if (typeof st.dataMb === 'number') setText('stat-disk', st.dataMb);
   if (typeof st.autoNext === 'boolean' && window.__dsh_autoNext) window.__dsh_autoNext(st.autoNext);
@@ -127,10 +131,14 @@ window.__dsh_autoNext = function (on) {
 };
 
 // ---------- 采集进度 ----------
-// 已采数量实时刷新(采集栏大数字 + 仪表盘)
-window.__dsh_count = function (count) {
-  setText('stat-total', count);
-  setText('nav-all-count', count);
+// 已采数量实时刷新(采集栏大数字 + 仪表盘;宿主按源推送,只更新对应域计数)
+window.__dsh_count = function (src, count) {
+  if (typeof src === 'number') { count = src; src = 'like'; }   // 兼容旧单参形态
+  setText(src === 'collection' ? 'src-coll-count' : 'src-like-count', count);
+  if (src === curSource) {
+    setText('stat-total', count);
+    setText('nav-all-count', count);
+  }
 };
 window.__dsh_collectStatus = function (msg) {
   collecting = true;
@@ -176,11 +184,13 @@ function renderStats() {
   setText('nav-all-count', total);
   setText('nav-gallery-count', gallery);
   setText('nav-video-count', videos);
-  // 数量为 0:提醒用户采集(副文案高亮 + 按钮呼吸效果)
+  // 数量为 0:提醒用户采集(副文案高亮 + 按钮呼吸效果);文案随当前数据源
   const sub = document.getElementById('dash-sub');
   const btnCollect = document.getElementById('btn-collect');
   if (sub) {
-    sub.textContent = total === 0 ? '还没有数据,点右侧「❤ 采集」抓取你的喜欢列表。' : '可洗牌播放或点击卡片播放。';
+    sub.textContent = total === 0
+      ? (curSource === 'collection' ? '还没有收藏数据,点右侧「★ 采集收藏」抓取你的收藏列表。' : '还没有数据,点右侧「❤ 采集」抓取你的喜欢列表。')
+      : '可洗牌播放或点击卡片播放。';
     sub.classList.toggle('remind', total === 0);
   }
   if (btnCollect) btnCollect.classList.toggle('pulse', total === 0);
@@ -294,8 +304,8 @@ function toggleSelect(id) {
 function playVideo(id) {
   toast('正在获取播放地址…');
   // 附带当前筛选后的队列 id(与 shuffle 同理):宿主按它建顺序播放队列,
-  // 避免图集/视频分类下点卡片,顺序播放混入其他分类
-  call('play', id, filtered.map(i => i.awemeId)).then(r => {
+  // 避免图集/视频分类下点卡片,顺序播放混入其他分类;尾参 = 当前数据源(v1.0.8)
+  call('play', id, filtered.map(i => i.awemeId), curSource).then(r => {
     if (r && String(r).indexOf('err') === 0) toast(String(r), true);
   });
 }
@@ -314,7 +324,7 @@ function updateSelectUi() {
 // ---------- 刷新 ----------
 async function refresh() {
   try {
-    const r = await call('list');
+    const r = await call('list', curSource);
     items = (typeof r === 'string' ? JSON.parse(r) : (r || []));
     // 数据变化后清掉无效选择(不渲染,由下方 applyFilter 统一渲染一次,避免双重全量渲染卡顿)
     selectMode = false;
@@ -324,6 +334,47 @@ async function refresh() {
     applyFilter();
   } catch (e) { console.log('[ui] refresh err', e); }
 }
+
+// ---------- 数据源切换(v1.0.8):喜欢 ↔ 收藏 ----------
+// 两域独立采集/存储/筛选;切换即重拉列表并重置筛选/选择状态。
+function setSource(s) {
+  if (s !== 'like' && s !== 'collection') return;
+  if (s === curSource) return;
+  if (collecting) { toast('正在采集中,请等本轮采集结束后再切换', true); return; }
+  curSource = s;
+  ['like', 'collection'].forEach(k => {
+    const el = document.getElementById('src-' + (k === 'like' ? 'like' : 'coll'));
+    if (el) el.classList.toggle('active', k === curSource);
+  });
+  // 切源 = 换一套列表:分类/筛选/搜索/选择全部复位(与切账号行为一致)
+  navFilter = 'all';
+  yearFilter = ''; monthFilter = ''; searchText = '';
+  const searchEl = document.getElementById('search');
+  if (searchEl) searchEl.value = '';
+  const ys = document.getElementById('year-filter'); if (ys) ys.value = '';
+  const ms = document.getElementById('month-filter'); if (ms) ms.value = '';
+  ['all', 'gallery', 'video'].forEach(k => {
+    const el = document.getElementById('nav-' + k);
+    if (el) el.classList.toggle('active', k === 'all');
+  });
+  applySourceUi();
+  refresh();
+  toast(s === 'collection' ? '已切换到收藏列表' : '已切换到喜欢列表', false);
+}
+// 按当前源更新采集按钮/副文案/取消点赞按钮的可见性
+function applySourceUi() {
+  const isLike = curSource === 'like';
+  setText('dash-label', isLike ? 'MY LIKES' : 'MY COLLECTION');
+  const btnLabel = document.getElementById('btn-collect-label');
+  if (btnLabel) btnLabel.textContent = isLike ? '采集' : '采集收藏';
+  const btnCollect = document.getElementById('btn-collect');
+  if (btnCollect) btnCollect.title = isLike ? '直连快采喜欢列表' : '直连快采收藏列表';
+  const btnUnlike = document.getElementById('btn-unlike');
+  // 取消点赞只对"喜欢"有意义;收藏视图隐藏该按钮
+  if (btnUnlike) btnUnlike.classList.toggle('hidden', !isLike);
+}
+on('src-like', 'click', () => setSource('like'));
+on('src-coll', 'click', () => setSource('collection'));
 
 
 // ---------- 批量取消抖音点赞 ----------
@@ -374,9 +425,9 @@ on('btn-collect', 'click', async () => {
   // 防暴力:采集中/停止收尾期(3s 内点过停止)不再发起新采集
   if (collecting) { toast('正在采集中,请看顶部进度条;频繁点击易触发限流', true); return; }
   if (Date.now() - stopAt < 3000) { toast('正在停止收尾,请等进度条消失后再点采集', true); return; }
-  const r = await call('collect');
+  const r = await call('collect', curSource);
   if (r === 'busy') { toast('正在采集中,请耐心等待;频繁点击易触发限流', true); return; }
-  if (r === 'started') window.__dsh_collectStatus('正在检查接口状态…可能需要几十秒');
+  if (r === 'started') window.__dsh_collectStatus(curSource === 'collection' ? '正在检查收藏接口状态…可能需要几十秒' : '正在检查接口状态…可能需要几十秒');
   else if (r && String(r).indexOf('err') === 0) toast(String(r), true);
 });
 let stopAt = 0;
@@ -389,9 +440,9 @@ on('btn-stop-collect', 'click', async () => {
 on('btn-shuffle', 'click', async () => {
   if (filtered.length === 0) { toast('当前筛选下没有可播放的内容', true); return; }
   if (!loggedIn) { toast('请先点左下角「账号」登录', true); return; }
-  // 按当前筛选条件(年份/月份/分类/搜索)洗牌
+  // 按当前筛选条件(年份/月份/分类/搜索)洗牌;尾参 = 当前数据源(v1.0.8)
   const ids = filtered.map(i => i.awemeId);
-  const r = await call('shuffle', ids);
+  const r = await call('shuffle', ids, curSource);
   if (r === 'empty') toast('没有可播放的内容', true);
   else if (r && String(r).indexOf('err') === 0) toast(String(r), true);
 });
@@ -441,7 +492,7 @@ on('btn-unlike', 'click', async () => {
 
   const ids = [...selected];
   setUnlikeBtn(true);
-  const r = await call('unlike', ids);
+  const r = await call('unlike', ids, curSource);   // 尾参源:C# 端收藏视图直接拒绝(双保险)
   if (r === 'started') { /* 进度条由宿主 __dsh_unlikeStart 接管 */ }
   else if (r === 'busy') { toast('已有取消点赞任务正在执行', true); setUnlikeBtn(false); }
   else if (r && String(r).indexOf('err') === 0) { toast(String(r), true); setUnlikeBtn(false); }
@@ -453,13 +504,13 @@ on('btn-delete', 'click', async () => {
   if (selected.size === 0) { toast('请先勾选要删除的条目', true); return; }
   if (!confirm(`确定删除选中的 ${selected.size} 条吗?\n此操作不可恢复。`)) return;
   const ids = [...selected];
-  const r = await call('delete', ids);
+  const r = await call('delete', ids, curSource);
   if (r && String(r).indexOf('err') === 0) { toast(String(r), true); return; }
   toast(`已删除 ${ids.length} 条`);
   await refresh();   // refresh 内含退出选择模式(单次渲染)
 });
-on('btn-export', 'click', async () => { const r = await call('export'); toast(r || '已导出'); });
-on('btn-import', 'click', async () => { const r = await call('import'); toast(r || '导入完成'); });
+on('btn-export', 'click', async () => { const r = await call('export', curSource); toast(r || '已导出'); });
+on('btn-import', 'click', async () => { const r = await call('import', curSource); toast(r || '导入完成'); });
 on('btn-stop', 'click', async () => { await call('stop'); setPlaying(''); });
 on('year-filter', 'change', e => { yearFilter = e.target.value; renderMonthOptions(); applyFilter(); });
 on('month-filter', 'change', e => { monthFilter = e.target.value; applyFilter(); });
@@ -933,6 +984,7 @@ window.__dsh_setTheme = function (theme) {
 window.addEventListener('DOMContentLoaded', () => {
   bindGrid();
   updateSelectUi();
+  applySourceUi();   // v1.0.8:初始源(喜欢)的按钮/文案状态
   initTheme();
   loadAccountEntry();
   // 自动连播开关(与播放页 🔁 / 快捷键 A 同源;宿主广播 __dsh_autoNext 回显勾选态)
